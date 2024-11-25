@@ -10,7 +10,8 @@ from node_client import NodeClient
 
 if __name__ == '__main__':
     tracker_url = 'http://localhost:8000'
-    listening_port = 6883  # Replace X with the port number for this leecher
+    listening_port = 6883
     role = 'leecher'
-    node = NodeClient(tracker_url=tracker_url, listening_port=listening_port, role=role)
-    node.start()
+    leecher = NodeClient(tracker_url, listening_port, role)
+    leecher.start()
+

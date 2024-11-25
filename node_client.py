@@ -11,7 +11,7 @@ from piece_manager import PieceManager
 from peer_connection import PeerConnection
 import bencodepy
 import hashlib
-import sys  # Added import
+import sys
 from queue import Queue
 
 class NodeClient:
@@ -27,18 +27,22 @@ class NodeClient:
         self.info_hash = None
         self.piece_manager = None
         self.connected_peers = []
+        self.connected_peer_addresses = set()  # Track connected peer addresses as (ip, port) tuples
         self.request_queue = Queue()
+        self.piece_hashes = []
 
     def generate_peer_id(self):
-        return '-STA0001-' + ''.join(random.choices(string.digits, k=12))
+        peer_id = '-STA0001-' + ''.join(random.choices(string.digits, k=11))
+        assert len(peer_id) == 20, f"peer_id length is {len(peer_id)}, expected 20."
+        return peer_id
 
     def start(self):
-        if not self.load_torrent('example.torrent'):
+        if not self.load_torrent('files/example.torrent'):
             print("Failed to load torrent file. Exiting.")
             return
 
         # Start listening for peers (both seeders and leechers)
-        threading.Thread(target=self.listen_for_peers).start()
+        threading.Thread(target=self.listen_for_peers, daemon=True).start()
 
         # Announce to tracker
         self.announce_to_tracker(event='started')
@@ -47,7 +51,7 @@ class NodeClient:
         self.main_loop()
 
     def load_torrent(self, torrent_path):
-        # Get the directory of the main script (e.g., run_node2.py)
+        # Get the directory of the main script (e.g., run_node.py or run_node2.py)
         node_dir = os.path.dirname(os.path.abspath(sys.modules['__main__'].__file__))
 
         # Construct the full path to the torrent file
@@ -61,14 +65,17 @@ class NodeClient:
 
         self.metainfo = metainfo  # Keys are bytes
 
-        # Calculate info_hash
+        # Calculate info_hash and extract piece hashes
         info = self.metainfo[b'info']
         encoded_info = bencodepy.encode(info)
-        self.info_hash = hashlib.sha1(encoded_info).hexdigest()
+        self.info_hash = hashlib.sha1(encoded_info).digest()  # Use raw bytes
+        pieces = self.metainfo[b'info'][b'pieces']
+        self.piece_hashes = [pieces[i:i + 20] for i in range(0, len(pieces), 20)]
 
         self.piece_manager = PieceManager(self.metainfo)
+        self.piece_manager.piece_hashes = self.piece_hashes
 
-        # Construct the file path for the shared file
+        # Construct the file path for the shared file/directory
         file_name = self.metainfo[b'info'][b'name'].decode('utf-8')
         file_path = os.path.join(node_dir, file_name)
 
@@ -87,12 +94,15 @@ class NodeClient:
         self.server_socket.listen(5)
         print(f"Listening for peers on port {self.listening_port}...")
         while self.running:
-            client_socket, addr = self.server_socket.accept()
-            print(f"Accepted connection from {addr}")
-            peer_conn = PeerConnection.from_incoming(client_socket, self.piece_manager, self.peer_id, self.info_hash,
-                                                     self)
-            peer_conn.start()
-            self.connected_peers.append(peer_conn)
+            try:
+                client_socket, addr = self.server_socket.accept()
+                print(f"Accepted connection from {addr}")
+                peer_conn = PeerConnection.from_incoming(client_socket, self.piece_manager, self.peer_id, self.info_hash, self)
+                peer_conn.start()
+                self.connected_peers.append(peer_conn)
+                # Note: Peer ID is not known yet; will be updated after handshake
+            except Exception as e:
+                print(f"Error accepting connections: {e}")
 
     def announce_to_tracker(self, event):
         params = {
@@ -116,48 +126,47 @@ class NodeClient:
         except Exception as e:
             print(f"Error announcing to tracker: {e}")
 
-    import sys  # Ensure sys is imported at the top of the file
-
     def main_loop(self):
         if self.role == 'seeder':
             print("Seeder is ready to upload to peers.")
             while self.running:
                 time.sleep(10)  # Keep the seeder running
         else:
-            # Wait for a short time to allow initial peer connections
-            time.sleep(2)
-            # Initialize the request queue with rarest pieces first
-            for piece_index in self.piece_manager.get_rarest_pieces():
-                self.request_queue.put(piece_index)
-
             while self.running and not self.piece_manager.is_complete():
                 self.connect_to_peers()
                 time.sleep(10)
             if self.piece_manager.is_complete():
                 print("Download complete.")
-                # Reconstruct the file
+                # Reconstruct the files
                 node_dir = os.path.dirname(os.path.abspath(sys.modules['__main__'].__file__))
-                file_name = self.metainfo[b'info'][b'name'].decode('utf-8')
-                output_path = os.path.join(node_dir, file_name)
-                self.piece_manager.reconstruct_file(output_path)
+                download_dir = os.path.join(node_dir, self.metainfo[b'info'][b'name'].decode('utf-8'))
+                self.piece_manager.reconstruct_files(download_dir)
                 self.announce_to_tracker(event='completed')
                 self.display_statistics()
 
+                # Switch role to 'seeder'
+                self.role = 'seeder'
+                print("Now acting as seeder. Ready to upload to peers.")
+
+                # Continue running as seeder
+                while self.running:
+                    time.sleep(10)  # Keep the seeder running
+
     def connect_to_peers(self):
         for peer_info in self.peers:
-            peer_id = peer_info.get('peer_id')
             ip = peer_info.get('ip')
             port = int(peer_info.get('port'))
 
-            if ip == '127.0.0.1' and port == self.listening_port:
-                # Skip connecting to self
-                print(f"Skipping connection to self at {ip}:{port}")
+            peer_address = (ip, port)
+            if peer_address in self.connected_peer_addresses:
+                print(f"Already connected to peer at {ip}:{port}")
                 continue
 
             print(f"Connecting to peer {ip}:{port}")
             peer_conn = PeerConnection(ip, port, self.piece_manager, self.peer_id, self.info_hash, self)
             peer_conn.start()
             self.connected_peers.append(peer_conn)
+            self.connected_peer_addresses.add(peer_address)
 
     def display_statistics(self):
         print(f"Downloaded: {self.piece_manager.downloaded} bytes")
