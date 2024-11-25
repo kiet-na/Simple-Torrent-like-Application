@@ -152,6 +152,8 @@ class NodeClient:
                 while self.running:
                     time.sleep(10)  # Keep the seeder running
 
+    # node_client.py
+
     def connect_to_peers(self):
         for peer_info in self.peers:
             ip = peer_info.get('ip')
@@ -159,10 +161,8 @@ class NodeClient:
 
             peer_address = (ip, port)
             if peer_address in self.connected_peer_addresses:
-                print(f"Already connected to peer at {ip}:{port}")
                 continue
 
-            print(f"Connecting to peer {ip}:{port}")
             peer_conn = PeerConnection(ip, port, self.piece_manager, self.peer_id, self.info_hash, self)
             peer_conn.start()
             self.connected_peers.append(peer_conn)

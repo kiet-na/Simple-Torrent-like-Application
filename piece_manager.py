@@ -106,13 +106,10 @@ class PieceManager:
             # Return the rarest piece available
             missing_pieces = list(self.missing_pieces)
             missing_pieces.sort(key=lambda index: self.piece_availability[index])
-            selected_piece = missing_pieces[0]
-            print(
-                f"next_missing_piece() selected piece {selected_piece} with availability {self.piece_availability[selected_piece]}")
-            return selected_piece
-        else:
-            print("next_missing_piece() found no missing pieces.")
-            return None
+            for piece in missing_pieces:
+                if piece not in self.requested_pieces:
+                    return piece
+        return None
 
     def is_complete(self):
         return len(self.missing_pieces) == 0

@@ -233,3 +233,104 @@ class PeerConnection(threading.Thread):
     def display_statistics(self):
         print(f"Downloaded: {self.piece_manager.downloaded} bytes")
         print(f"Uploaded: {self.piece_manager.uploaded} bytes")
+
+    # peer_connection.py
+
+    def handle_messages(self):
+        while self.running:
+            try:
+                msg_id, payload = self.receive_message()
+                if msg_id is None:
+                    continue  # Keep-alive
+                elif msg_id == 0:  # Choke
+                    self.peer_choking = True
+                elif msg_id == 1:  # Unchoke
+                    self.peer_choking = False
+                    # Start requesting pieces
+                    if self.client.role == 'leecher':
+                        self.request_pieces()
+                elif msg_id == 2:  # Interested
+                    self.peer_interested = True
+                elif msg_id == 3:  # Not Interested
+                    self.peer_interested = False
+                elif msg_id == 4:  # Have
+                    piece_index = struct.unpack('>I', payload)[0]
+                    self.update_peer_bitfield(piece_index)
+                elif msg_id == 5:  # Bitfield
+                    self.peer_bitfield = payload
+                    self.piece_manager.update_piece_availability(self.peer_bitfield)
+                elif msg_id == 6:  # Request
+                    if self.client.role == 'seeder':
+                        self.handle_request(payload)
+                elif msg_id == 7:  # Piece
+                    self.handle_piece(payload)
+                elif msg_id == 8:  # Cancel
+                    # Handle cancel if necessary
+                    pass
+                else:
+                    print(f"Unknown message ID: {msg_id}")
+            except Exception as e:
+                print(f"Error handling messages: {e}")
+                break
+
+    def request_pieces(self):
+        pipeline_size = 5  # Number of outstanding requests
+        while not self.piece_manager.is_complete():
+            if self.peer_choking:
+                break  # Cannot request when choked
+            while len(self.piece_manager.requested_pieces) < pipeline_size:
+                piece_index = self.piece_manager.next_missing_piece()
+                if piece_index is None:
+                    break
+                if not self.has_piece(piece_index):
+                    continue
+                self.piece_manager.requested_pieces.add(piece_index)
+                # Send request message
+                payload = struct.pack('>III', piece_index, 0, self.piece_manager.get_piece_length(piece_index))
+                self.send_message(6, payload)
+                print(f"Requested piece {piece_index} from {self.ip}:{self.port}")
+            # Wait for incoming messages
+            msg_id, payload = self.receive_message()
+            if msg_id == 7:  # Piece
+                self.handle_piece(payload)
+            elif msg_id == 0:  # Choke
+                self.peer_choking = True
+                break
+            else:
+                # Handle other messages
+                pass
+
+    def handle_piece(self, payload):
+        index, begin = struct.unpack('>II', payload[:8])
+        block = payload[8:]
+        self.piece_manager.add_piece_block(index, begin, block)
+        print(f"Received piece {index} from {self.ip}:{self.port}")
+
+    def handle_request(self, payload):
+        index, begin, length = struct.unpack('>III', payload)
+        piece_data = self.piece_manager.get_piece_block(index, begin, length)
+        if piece_data:
+            # Send piece message
+            piece_payload = struct.pack('>II', index, begin) + piece_data
+            self.send_message(7, piece_payload)
+            print(f"Sent piece {index} to {self.ip}:{self.port}")
+        else:
+            print(f"Piece {index} not available")
+
+    def manage_choking(self):
+        # Simple policy: unchoke all peers
+        self.send_message(1)  # Unchoke
+        self.peer_choking = False
+
+    def update_interest(self):
+        if self.client.role == 'leecher':
+            if self.has_pieces_of_interest():
+                self.send_message(2)  # Interested
+            else:
+                self.send_message(3)  # Not Interested
+
+    def has_pieces_of_interest(self):
+        for index in self.piece_manager.missing_pieces:
+            if self.has_piece(index):
+                return True
+        return False
