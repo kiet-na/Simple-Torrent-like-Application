@@ -12,6 +12,7 @@ from peer_connection import PeerConnection
 import bencodepy
 import hashlib
 import sys  # Added import
+from queue import Queue
 
 class NodeClient:
     def __init__(self, tracker_url, listening_port, role):
@@ -25,6 +26,8 @@ class NodeClient:
         self.metainfo = None
         self.info_hash = None
         self.piece_manager = None
+        self.connected_peers = []
+        self.request_queue = Queue()
 
     def generate_peer_id(self):
         return '-STA0001-' + ''.join(random.choices(string.digits, k=12))
@@ -34,7 +37,7 @@ class NodeClient:
             print("Failed to load torrent file. Exiting.")
             return
 
-        # Start listening for peers
+        # Start listening for peers (both seeders and leechers)
         threading.Thread(target=self.listen_for_peers).start()
 
         # Announce to tracker
@@ -85,9 +88,11 @@ class NodeClient:
         print(f"Listening for peers on port {self.listening_port}...")
         while self.running:
             client_socket, addr = self.server_socket.accept()
-            print(f"Accep   ted connection from {addr}")
-            peer_conn = PeerConnection.from_incoming(client_socket, self.piece_manager, self.peer_id, self.info_hash)
+            print(f"Accepted connection from {addr}")
+            peer_conn = PeerConnection.from_incoming(client_socket, self.piece_manager, self.peer_id, self.info_hash,
+                                                     self)
             peer_conn.start()
+            self.connected_peers.append(peer_conn)
 
     def announce_to_tracker(self, event):
         params = {
@@ -119,6 +124,12 @@ class NodeClient:
             while self.running:
                 time.sleep(10)  # Keep the seeder running
         else:
+            # Wait for a short time to allow initial peer connections
+            time.sleep(2)
+            # Initialize the request queue with rarest pieces first
+            for piece_index in self.piece_manager.get_rarest_pieces():
+                self.request_queue.put(piece_index)
+
             while self.running and not self.piece_manager.is_complete():
                 self.connect_to_peers()
                 time.sleep(10)
@@ -144,8 +155,9 @@ class NodeClient:
                 continue
 
             print(f"Connecting to peer {ip}:{port}")
-            peer_conn = PeerConnection(ip, port, self.piece_manager, self.peer_id, self.info_hash)
+            peer_conn = PeerConnection(ip, port, self.piece_manager, self.peer_id, self.info_hash, self)
             peer_conn.start()
+            self.connected_peers.append(peer_conn)
 
     def display_statistics(self):
         print(f"Downloaded: {self.piece_manager.downloaded} bytes")

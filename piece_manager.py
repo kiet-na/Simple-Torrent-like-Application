@@ -1,7 +1,6 @@
 # piece_manager.py
 
 import hashlib
-import os
 
 class PieceManager:
     def __init__(self, metainfo):
@@ -13,6 +12,8 @@ class PieceManager:
         self.missing_pieces = set(range(self.total_pieces))
         self.downloaded = 0
         self.uploaded = 0
+        self.requested_pieces = set()
+        self.piece_availability = [0] * self.total_pieces
 
     def add_piece(self, index, data):
         if index in self.pieces:
@@ -22,10 +23,12 @@ class PieceManager:
         if actual_hash == expected_hash:
             self.pieces[index] = data
             self.missing_pieces.remove(index)
+            self.requested_pieces.discard(index)
             self.downloaded += len(data)
             print(f"Piece {index} verified and added.")
         else:
             print(f"Piece {index} failed hash check.")
+            self.requested_pieces.discard(index)  # Allow re-requesting
 
     def get_piece(self, index):
         return self.pieces.get(index)
@@ -34,6 +37,12 @@ class PieceManager:
         start = index * 20  # Each SHA-1 hash is 20 bytes
         end = start + 20
         return self.metainfo[b'info'][b'pieces'][start:end]
+
+    def get_piece_length(self, index):
+        if index == self.total_pieces - 1:
+            return self.total_length - index * self.piece_length
+        else:
+            return self.piece_length
 
     def next_missing_piece(self):
         if self.missing_pieces:
@@ -64,4 +73,31 @@ class PieceManager:
                 self.pieces[index] = piece_data
                 self.missing_pieces.discard(index)
         print(f"Loaded {len(self.pieces)} pieces from file.")
+
+    def update_piece_availability(self, peer_bitfield):
+        for index in range(self.total_pieces):
+            if self.has_piece_in_bitfield(peer_bitfield, index):
+                self.piece_availability[index] += 1
+
+    def has_piece_in_bitfield(self, bitfield, index):
+        byte_index = index // 8
+        bit_index = index % 8
+        if byte_index >= len(bitfield):
+            return False
+        return (bitfield[byte_index] >> (7 - bit_index)) & 1
+
+    def get_rarest_pieces(self):
+        # Return missing pieces sorted by availability
+        missing_pieces = list(self.missing_pieces)
+        missing_pieces.sort(key=lambda index: self.piece_availability[index])
+        return missing_pieces
+
+    def get_bitfield(self):
+        bitfield_length = (self.total_pieces + 7) // 8
+        bitfield = bytearray(bitfield_length)
+        for index in self.pieces.keys():
+            byte_index = index // 8
+            bit_index = index % 8
+            bitfield[byte_index] |= 1 << (7 - bit_index)
+        return bytes(bitfield)
 
