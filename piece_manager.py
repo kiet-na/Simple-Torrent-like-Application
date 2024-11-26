@@ -82,7 +82,7 @@ class PieceManager:
             self.missing_pieces.discard(index)
             self.requested_pieces.discard(index)
             self.downloaded += len(data)
-            print(f"Piece {index} verified and added.")
+            print(f"Piece {index} verified and added. Total downloaded: {self.downloaded} bytes.")
         else:
             print(f"Piece {index} failed hash check.")
             self.requested_pieces.discard(index)  # Allow re-requesting
@@ -198,6 +198,13 @@ class PieceManager:
             return False
         return (bitfield[byte_index] >> (7 - bit_index)) & 1
 
+    def update_piece_availability_for_piece(self, index):
+        self.piece_availability[index] += 1
+        print(f"Piece {index} availability incremented to {self.piece_availability[index]}")
+
+    def has_piece(self, index):
+        return index in self.pieces
+
     def get_rarest_pieces(self):
         # Return missing pieces sorted by availability
         missing_pieces = list(self.missing_pieces)
@@ -212,3 +219,5 @@ class PieceManager:
             bit_index = index % 8
             bitfield[byte_index] |= 1 << (7 - bit_index)
         return bytes(bitfield)
+
+

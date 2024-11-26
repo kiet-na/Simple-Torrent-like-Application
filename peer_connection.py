@@ -7,6 +7,15 @@ import socket
 import sys
 import time
 
+MESSAGE_CHOKE = 0
+MESSAGE_UNCHOKE = 1
+MESSAGE_INTERESTED = 2
+MESSAGE_NOT_INTERESTED = 3
+MESSAGE_HAVE = 4
+MESSAGE_BITFIELD = 5
+MESSAGE_REQUEST = 6
+MESSAGE_PIECE = 7
+MESSAGE_CANCEL = 8
 
 class PeerConnection(threading.Thread):
     def __init__(self, ip, port, piece_manager, peer_id, info_hash, client, sock=None, is_incoming=False):
@@ -22,6 +31,10 @@ class PeerConnection(threading.Thread):
         self.buffer = b''
         self.bitfield = b''
         self.remote_peer_id = None  # Store remote peer_id
+        self.am_choking = True
+        self.am_interested = False
+        self.peer_choking = True
+        self.peer_interested = False
 
         if not self.is_incoming:
             if sock is None:
@@ -39,7 +52,7 @@ class PeerConnection(threading.Thread):
     def run(self):
         try:
             self.perform_handshake()
-            self.exchange_bitfield()
+            # self.exchange_bitfield()  # Redundant
             self.communicate()
         except Exception as e:
             print(f"Connection error with peer {self.ip}:{self.port} - {e}")
@@ -55,282 +68,250 @@ class PeerConnection(threading.Thread):
             print(f"Connection with peer {self.ip}:{self.port} closed.")
 
     def perform_handshake(self):
-        handshake_msg = b'HELLO' + self.info_hash + self.peer_id.encode('utf-8')
+        pstr = 'BitTorrent protocol'
+        pstrlen = len(pstr)
+        reserved = b'\x00' * 8
+        handshake_msg = struct.pack('!B', pstrlen) + pstr.encode(
+            'utf-8') + reserved + self.info_hash + self.peer_id.encode('utf-8')
+
         if not self.is_incoming:
             print(f"Outgoing connection to {self.ip}:{self.port}")
             self.socket.connect((self.ip, self.port))
             self.socket.sendall(handshake_msg)
             print(f"Sent handshake to {self.ip}:{self.port}")
-            response = self.recvall(45)  # 'HELLO' + 20-byte info_hash + 8-byte peer_id (assuming 8-byte peer_id)
-            if not response.startswith(b'HELLO'):
+            response = self.recvall(68)  # Handshake message is 68 bytes
+            if len(response) < 68:
                 raise Exception("Invalid handshake response")
-            received_info_hash = response[5:25]
-            received_peer_id = response[25:].decode('utf-8')
+            received_pstrlen = response[0]
+            received_pstr = response[1:1 + received_pstrlen]
+            received_info_hash = response[1 + pstrlen + 8:1 + pstrlen + 8 + 20]
+            received_peer_id = response[1 + pstrlen + 8 + 20:].decode('utf-8', errors='ignore')
+
             if received_info_hash != self.info_hash:
                 raise Exception("Info hash does not match")
             self.remote_peer_id = received_peer_id
             print(f"Connected to peer {self.ip}:{self.port} with peer_id {self.remote_peer_id}")
 
-            # Send BITFIELD using standardized message format
-            self.send_message('BITFIELD', self.piece_manager.get_bitfield())
-            print(f"Sent BITFIELD to peer {self.ip}:{self.port}")
+            # Send BITFIELD
+            bitfield = self.piece_manager.get_bitfield()
+            if bitfield:
+                self.send_message(MESSAGE_BITFIELD, bitfield)
+                print(f"Sent BITFIELD to peer {self.ip}:{self.port}")
 
-            # Receive BITFIELD from peer
-            msg_type, payload = self.receive_message()
-            if msg_type == 'BITFIELD':
-                self.bitfield = payload
-                self.piece_manager.update_piece_availability(self.bitfield)
-                print(f"Received BITFIELD from peer {self.ip}:{self.port}")
         else:
             print(f"Incoming connection from {self.ip}:{self.port}")
-            data = self.recvall(45)  # Receive 'HELLO' + 20-byte info_hash + 8-byte peer_id
-            if not data.startswith(b'HELLO'):
+            data = self.recvall(68)
+            if len(data) < 68:
                 raise Exception("Invalid handshake message")
-            received_info_hash = data[5:25]
-            received_peer_id = data[25:].decode('utf-8')
+            received_pstrlen = data[0]
+            received_pstr = data[1:1 + received_pstrlen]
+            received_info_hash = data[1 + pstrlen + 8:1 + pstrlen + 8 + 20]
+            received_peer_id = data[1 + pstrlen + 8 + 20:].decode('utf-8', errors='ignore')
+
             if received_info_hash != self.info_hash:
                 raise Exception("Info hash does not match")
             self.remote_peer_id = received_peer_id
+
+            # Send handshake
             self.socket.sendall(handshake_msg)
             print(f"Accepted connection from {self.ip}:{self.port} with peer_id {self.remote_peer_id}")
 
-            # Receive BITFIELD from peer
-            msg_type, payload = self.receive_message()
-            if msg_type == 'BITFIELD':
+            # Receive BITFIELD
+            msg_id, payload = self.receive_message()
+            if msg_id == MESSAGE_BITFIELD:
                 self.bitfield = payload
                 self.piece_manager.update_piece_availability(self.bitfield)
                 print(f"Received BITFIELD from peer {self.ip}:{self.port}")
 
-            # Send BITFIELD using standardized message format
-            self.send_message('BITFIELD', self.piece_manager.get_bitfield())
+        # Send our BITFIELD after handshake
+        bitfield = self.piece_manager.get_bitfield()
+        if bitfield:
+            self.send_message(MESSAGE_BITFIELD, bitfield)
             print(f"Sent BITFIELD to peer {self.ip}:{self.port}")
 
-    def exchange_bitfield(self):
-        # This method is now redundant as BITFIELD exchange is handled in perform_handshake
-        pass
+    def keep_alive(self):
+        while self.running:
+            time.sleep(120)  # Send keep-alive every 2 minutes
+            try:
+                self.socket.sendall(struct.pack('!I', 0))
+                print(f"Sent keep-alive to {self.ip}:{self.port}")
+            except Exception as e:
+                print(f"Error sending keep-alive to {self.ip}:{self.port} - {e}")
+                break
 
     def communicate(self):
-        if self.client.role == 'leecher':
-            # Leecher behavior: request pieces
-            print("Leecher: Starting communicate loop.")
-            while self.running and not self.piece_manager.is_complete():
-                piece_index = self.piece_manager.next_missing_piece()
-                print(f"Leecher: next_missing_piece() returned {piece_index}")
-                if piece_index is None:
-                    break  # All pieces downloaded
-                # Request the piece
-                self.request_piece(piece_index)
-                # Wait for the piece
-                print(f"Leecher: Waiting for PIECE {piece_index}")
-                try:
-                    msg_type, payload = self.receive_message()
-                    print(f"Leecher: Received message type {msg_type}")
-                    if msg_type == 'PIECE':
-                        received_piece_index, piece_data = self.parse_piece(payload)
-                        self.piece_manager.add_piece(received_piece_index, piece_data)
-                        print(f"Leecher: Received Piece {received_piece_index} from peer {self.ip}:{self.port}")
-                except Exception as e:
-                    print(f"Leecher: Error receiving PIECE - {e}")
-                    break
-            print(f"Leecher: Download complete from peer {self.ip}:{self.port}")
-        elif self.client.role == 'seeder':
-            # Seeder behavior: respond to piece requests
-            print("Seeder: Starting communicate loop.")
-            while self.running:
-                try:
-                    msg_type, payload = self.receive_message()
-                    print(f"Seeder: Received message type {msg_type}")
-                    if msg_type == 'REQUEST':
-                        piece_index = struct.unpack('!I', payload[:4])[0]  # 4-byte piece index
-                        print(f"Seeder: Processing REQUEST for piece {piece_index}")
-                        piece_data = self.piece_manager.get_piece(piece_index)
-                        if piece_data:
-                            # Send PIECE message and increment uploaded
-                            self.send_piece(piece_index)
-                            print(f"Seeder: Sent PIECE {piece_index} to peer {self.ip}:{self.port}")
-                        else:
-                            print(f"Seeder: Piece {piece_index} requested by peer {self.ip}:{self.port} not available.")
-                except Exception as e:
-                    print(f"Seeder: Error in communication with peer {self.ip}:{self.port} - {e}")
-                    break
-            print(f"Seeder: Communication with peer {self.ip}:{self.port} ended.")
+        # Start a thread to send keep-alive messages if needed
+        threading.Thread(target=self.keep_alive, daemon=True).start()
 
-    def send_message(self, msg_type, payload):
-        if msg_type == 'BITFIELD':
-            msg_type_padded = msg_type.ljust(8).encode('utf-8')
-            msg_length = 8 + len(payload)
-            msg = struct.pack('!I', msg_length) + msg_type_padded + payload
-            self.socket.sendall(msg)
-            print(f"Sent BITFIELD to {self.ip}:{self.port}")
-        elif msg_type == 'REQUEST':
-            # Message format: [4-byte length][8-byte type][4-byte piece_index]
-            msg_type_padded = msg_type.ljust(8).encode('utf-8')
-            msg_length = 8 + 4  # 8-byte type + 4-byte piece index
-            msg = struct.pack('!I', msg_length) + msg_type_padded + struct.pack('!I', payload)
-            self.socket.sendall(msg)
-            print(f"Sent REQUEST for piece {payload} to {self.ip}:{self.port}")
-        elif msg_type == 'PIECE':
-            # Message format: [4-byte length][8-byte type][4-byte piece_index][piece_data]
-            msg_type_padded = msg_type.ljust(8).encode('utf-8')
-            msg_length = 8 + len(payload)  # 8-byte type + payload
-            msg = struct.pack('!I', msg_length) + msg_type_padded + payload
-            self.socket.sendall(msg)
-            print(f"Sent PIECE to {self.ip}:{self.port}")
-        else:
-            print(f"Unknown message type: {msg_type}")
+        # After handshake, update interest state
+        self.update_interest()
+
+        while self.running:
+            try:
+                msg_id, payload = self.receive_message()
+                if msg_id is None:
+                    continue  # Keep-alive
+                self.handle_message(msg_id, payload)
+            except Exception as e:
+                print(f"Error in communication with peer {self.ip}:{self.port} - {e}")
+                break
+
+    def send_message(self, msg_id, payload=b''):
+        msg_length = 1 + len(payload)
+        msg = struct.pack('!I', msg_length) + struct.pack('!B', msg_id) + payload
+        self.socket.sendall(msg)
 
     def receive_message(self):
         length_bytes = self.recvall(4)
         if not length_bytes:
             raise Exception("Connection closed")
         length = struct.unpack('!I', length_bytes)[0]
-        msg_type_bytes = self.recvall(8)
-        if not msg_type_bytes:
+        if length == 0:
+            # Keep-alive message
+            return None, None
+        msg_id_bytes = self.recvall(1)
+        if not msg_id_bytes:
             raise Exception("Connection closed")
-        msg_type = msg_type_bytes.decode('utf-8').strip()
-        payload_length = length - 8
-        payload = self.recvall(payload_length)
-        return msg_type, payload
-
-    def request_piece(self, piece_index):
-        if piece_index in self.piece_manager.requested_pieces:
-            print(f"Piece {piece_index} already requested from peer {self.ip}:{self.port}")
-            return  # Already requested
-        self.piece_manager.requested_pieces.add(piece_index)
-        self.send_message('REQUEST', piece_index)
-        print(f"Requested Piece {piece_index} from peer {self.ip}:{self.port}")
-
-    def parse_piece(self, payload):
-        # Assuming payload starts with 4-byte piece index followed by piece data
-        if len(payload) < 4:
-            raise Exception("Invalid PIECE payload")
-        piece_index = struct.unpack('!I', payload[:4])[0]
-        piece_data = payload[4:]
-        return piece_index, piece_data
+        msg_id = struct.unpack('!B', msg_id_bytes)[0]
+        payload_length = length - 1
+        payload = self.recvall(payload_length) if payload_length > 0 else b''
+        return msg_id, payload
 
     def recvall(self, n):
         data = b''
         while len(data) < n:
             packet = self.socket.recv(n - len(data))
             if not packet:
-                break
+                raise Exception("Connection closed")
             data += packet
         return data
+
+    def handle_message(self, msg_id, payload):
+        if msg_id == MESSAGE_CHOKE:
+            self.peer_choking = True
+            print(f"Peer {self.ip}:{self.port} choked us.")
+        elif msg_id == MESSAGE_UNCHOKE:
+            self.peer_choking = False
+            print(f"Peer {self.ip}:{self.port} unchoked us.")
+            # Start requesting pieces if interested
+            if self.am_interested:
+                self.request_pieces()
+        elif msg_id == MESSAGE_INTERESTED:
+            self.peer_interested = True
+            print(f"Peer {self.ip}:{self.port} is interested.")
+            # Decide whether to unchoke the peer
+            self.manage_choking()
+        elif msg_id == MESSAGE_NOT_INTERESTED:
+            self.peer_interested = False
+            print(f"Peer {self.ip}:{self.port} is not interested.")
+        elif msg_id == MESSAGE_HAVE:
+            piece_index = struct.unpack('!I', payload)[0]
+            self.piece_manager.update_piece_availability_for_piece(piece_index)
+            print(f"Peer {self.ip}:{self.port} has piece {piece_index}.")
+            # Update interest
+            self.update_interest()
+        elif msg_id == MESSAGE_BITFIELD:
+            self.bitfield = payload
+            self.piece_manager.update_piece_availability(self.bitfield)
+            print(f"Received BITFIELD from peer {self.ip}:{self.port}.")
+            # Update interest
+            self.update_interest()
+        elif msg_id == MESSAGE_REQUEST:
+            self.handle_request(payload)
+        elif msg_id == MESSAGE_PIECE:
+            self.handle_piece(payload)
+        elif msg_id == MESSAGE_CANCEL:
+            # Handle cancel if necessary
+            pass
+        else:
+            print(f"Unknown message ID: {msg_id}")
+
+    def request_pieces(self):
+        pipeline_size = 5  # Number of outstanding requests
+        while not self.piece_manager.is_complete() and self.am_interested and not self.peer_choking:
+            while len(self.piece_manager.requested_pieces) < pipeline_size:
+                piece_index = self.piece_manager.next_missing_piece()
+                if piece_index is None:
+                    break
+                if not self.has_piece_in_bitfield(self.bitfield, piece_index):
+                    continue
+                self.piece_manager.requested_pieces.add(piece_index)
+                # Send request message
+                payload = struct.pack('!I', piece_index)
+                self.send_message(MESSAGE_REQUEST, payload)
+                print(f"Requested piece {piece_index} from {self.ip}:{self.port}")
+            break  # Exit after sending requests to avoid blocking
+
+    def has_piece_in_bitfield(self, bitfield, index):
+        byte_index = index // 8
+        bit_index = index % 8
+        if byte_index >= len(bitfield):
+            return False
+        return (bitfield[byte_index] >> (7 - bit_index)) & 1
+
+    def has_piece(self, index):
+        return self.piece_manager.has_piece(index)
+
+    def handle_piece(self, payload):
+        piece_index = struct.unpack('!I', payload[:4])[0]
+        piece_data = payload[4:]
+        self.piece_manager.add_piece(piece_index, piece_data)
+        print(f"Received piece {piece_index} from {self.ip}:{self.port}")
+        # Broadcast HAVE message to connected peers
+        have_payload = struct.pack('!I', piece_index)
+        self.send_message(MESSAGE_HAVE, have_payload)
+        # Update interest
+        self.update_interest()
+        # Potentially request more pieces
+        if not self.peer_choking:
+            self.request_pieces()
+
+    def handle_request(self, payload):
+        piece_index = struct.unpack('!I', payload)[0]
+        if not self.am_choking:
+            self.send_piece(piece_index)
+        else:
+            print(f"Cannot send piece {piece_index} because we are choking the peer.")
 
     def send_piece(self, piece_index):
         try:
             piece_data = self.piece_manager.get_piece(piece_index)
             if piece_data is not None:
-                piece_payload = struct.pack('!I', piece_index) + piece_data
-                self.send_message('PIECE', piece_payload)
+                payload = struct.pack('!I', piece_index) + piece_data
+                self.send_message(MESSAGE_PIECE, payload)
                 self.piece_manager.uploaded += len(piece_data)
-                print(f"Uploaded piece {piece_index} to {self.ip}:{self.port}")
+                print(f"Uploaded piece {piece_index} to {self.ip}:{self.port}. Total uploaded: {self.piece_manager.uploaded} bytes.")
+            else:
+                print(f"Piece {piece_index} not available.")
         except Exception as e:
             print(f"Error sending piece {piece_index} to {self.ip}:{self.port} - {e}")
-            import traceback
-            traceback.print_exc()
-
-    def display_statistics(self):
-        print(f"Downloaded: {self.piece_manager.downloaded} bytes")
-        print(f"Uploaded: {self.piece_manager.uploaded} bytes")
-
-    # peer_connection.py
-
-    def handle_messages(self):
-        while self.running:
-            try:
-                msg_id, payload = self.receive_message()
-                if msg_id is None:
-                    continue  # Keep-alive
-                elif msg_id == 0:  # Choke
-                    self.peer_choking = True
-                elif msg_id == 1:  # Unchoke
-                    self.peer_choking = False
-                    # Start requesting pieces
-                    if self.client.role == 'leecher':
-                        self.request_pieces()
-                elif msg_id == 2:  # Interested
-                    self.peer_interested = True
-                elif msg_id == 3:  # Not Interested
-                    self.peer_interested = False
-                elif msg_id == 4:  # Have
-                    piece_index = struct.unpack('>I', payload)[0]
-                    self.update_peer_bitfield(piece_index)
-                elif msg_id == 5:  # Bitfield
-                    self.peer_bitfield = payload
-                    self.piece_manager.update_piece_availability(self.peer_bitfield)
-                elif msg_id == 6:  # Request
-                    if self.client.role == 'seeder':
-                        self.handle_request(payload)
-                elif msg_id == 7:  # Piece
-                    self.handle_piece(payload)
-                elif msg_id == 8:  # Cancel
-                    # Handle cancel if necessary
-                    pass
-                else:
-                    print(f"Unknown message ID: {msg_id}")
-            except Exception as e:
-                print(f"Error handling messages: {e}")
-                break
-
-    def request_pieces(self):
-        pipeline_size = 5  # Number of outstanding requests
-        while not self.piece_manager.is_complete():
-            if self.peer_choking:
-                break  # Cannot request when choked
-            while len(self.piece_manager.requested_pieces) < pipeline_size:
-                piece_index = self.piece_manager.next_missing_piece()
-                if piece_index is None:
-                    break
-                if not self.has_piece(piece_index):
-                    continue
-                self.piece_manager.requested_pieces.add(piece_index)
-                # Send request message
-                payload = struct.pack('>III', piece_index, 0, self.piece_manager.get_piece_length(piece_index))
-                self.send_message(6, payload)
-                print(f"Requested piece {piece_index} from {self.ip}:{self.port}")
-            # Wait for incoming messages
-            msg_id, payload = self.receive_message()
-            if msg_id == 7:  # Piece
-                self.handle_piece(payload)
-            elif msg_id == 0:  # Choke
-                self.peer_choking = True
-                break
-            else:
-                # Handle other messages
-                pass
-
-    def handle_piece(self, payload):
-        index, begin = struct.unpack('>II', payload[:8])
-        block = payload[8:]
-        self.piece_manager.add_piece_block(index, begin, block)
-        print(f"Received piece {index} from {self.ip}:{self.port}")
-
-    def handle_request(self, payload):
-        index, begin, length = struct.unpack('>III', payload)
-        piece_data = self.piece_manager.get_piece_block(index, begin, length)
-        if piece_data:
-            # Send piece message
-            piece_payload = struct.pack('>II', index, begin) + piece_data
-            self.send_message(7, piece_payload)
-            print(f"Sent piece {index} to {self.ip}:{self.port}")
-        else:
-            print(f"Piece {index} not available")
 
     def manage_choking(self):
-        # Simple policy: unchoke all peers
-        self.send_message(1)  # Unchoke
-        self.peer_choking = False
+        # Simple policy: unchoke interested peers
+        if self.peer_interested and self.am_choking:
+            self.am_choking = False
+            self.send_message(MESSAGE_UNCHOKE)
+            print(f"Unchoked peer {self.ip}:{self.port}")
+        elif not self.peer_interested and not self.am_choking:
+            self.am_choking = True
+            self.send_message(MESSAGE_CHOKE)
+            print(f"Choked peer {self.ip}:{self.port}")
 
     def update_interest(self):
-        if self.client.role == 'leecher':
-            if self.has_pieces_of_interest():
-                self.send_message(2)  # Interested
-            else:
-                self.send_message(3)  # Not Interested
+        # Check if we are interested in any pieces the peer has
+        if self.has_pieces_of_interest():
+            if not self.am_interested:
+                self.am_interested = True
+                self.send_message(MESSAGE_INTERESTED)
+                print(f"Sent INTERESTED to {self.ip}:{self.port}")
+        else:
+            if self.am_interested:
+                self.am_interested = False
+                self.send_message(MESSAGE_NOT_INTERESTED)
+                print(f"Sent NOT INTERESTED to {self.ip}:{self.port}")
 
     def has_pieces_of_interest(self):
         for index in self.piece_manager.missing_pieces:
-            if self.has_piece(index):
+            if self.has_piece_in_bitfield(self.bitfield, index):
                 return True
         return False
