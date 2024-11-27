@@ -5,10 +5,9 @@ import os
 import threading
 
 class PieceManager:
-    def __init__(self, metainfo, download_directory, verbose=False):
+    def __init__(self, metainfo, download_directory):
         self.metainfo = metainfo
         self.download_directory = download_directory
-        self.verbose = verbose
         self.piece_length = self.metainfo[b'info'][b'piece length']
         self.total_length = self.calculate_total_length()
         self.total_pieces = (self.total_length + self.piece_length - 1) // self.piece_length
@@ -17,7 +16,7 @@ class PieceManager:
         self.missing_pieces = set(range(self.total_pieces))
         self.downloaded = 0
         self.uploaded = 0
-        self.pieces_data_received = {}
+
         # Prepare file mappings
         self.file_mappings = self.create_file_mappings()
 
@@ -41,22 +40,28 @@ class PieceManager:
     def create_file_mappings(self):
         mappings = []
         offset = 0
-        root_directory = self.metainfo[b'info'][b'name'].decode('utf-8')
         if b'files' in self.metainfo[b'info']:
             files = self.metainfo[b'info'][b'files']
+            # Generate a list of files with their paths as strings for sorting
             files_with_paths = []
             for file_info in files:
                 path_components = [component.decode('utf-8') for component in file_info[b'path']]
-                # Include root_directory in the path components
-                full_path_components = [root_directory] + path_components
-                path_string = os.sep.join(full_path_components)
+                path_string = os.sep.join(path_components)
                 files_with_paths.append((path_string, file_info))
+            # Sort the files based on the path string
             files_with_paths.sort(key=lambda x: x[0])
+
+            # Print the sorted file paths
+            print("Files in piece_manager.py:")
+            for path_string, _ in files_with_paths:
+                print(path_string)
+
+            # Now process the files in sorted order
             for path_string, file_info in files_with_paths:
                 length = file_info[b'length']
                 path_components = path_string.split(os.sep)
                 mappings.append({
-                    'path': path_components,  # Now includes root_directory
+                    'path': path_components,
                     'length': length,
                     'offset': offset
                 })
@@ -72,44 +77,20 @@ class PieceManager:
             })
         return mappings
 
-    def add_piece(self, index, begin, block):
-        piece_length = self.get_piece_length(index)
-        with self.lock:
-            if index in self.pieces:
-                if self.verbose:
-                    print(f"Already have piece {index}. Ignoring.")
-                return  # Already have this piece
-
-            if index not in self.pieces_data:
-                self.pieces_data[index] = bytearray(piece_length)
-                self.pieces_data_received[index] = [False] * piece_length  # Track received bytes
-                if self.verbose:
-                    print(f"Initialized data structures for piece {index}.")
-
-            self.pieces_data[index][begin:begin + len(block)] = block
-            for i in range(begin, begin + len(block)):
-                self.pieces_data_received[index][i] = True
-
-            if self.verbose:
-                print(f"Updated piece {index}: Received {len(block)} bytes at offset {begin}.")
-
-            # Check if all bytes have been received
-            if all(self.pieces_data_received[index]):
-                expected_hash = self.get_piece_hash(index)
-                actual_hash = hashlib.sha1(self.pieces_data[index]).digest()
-                if actual_hash == expected_hash:
-                    self.pieces[index] = bytes(self.pieces_data[index])
-                    del self.pieces_data[index]
-                    self.pieces_data_received.pop(index, None)  # Safe removal
-                    self.missing_pieces.discard(index)
-                    self.requested_pieces.discard(index)
-                    self.downloaded += piece_length
-                    print(f"Piece {index} verified and added. Total downloaded: {self.downloaded} bytes.")
-                else:
-                    print(f"Piece {index} failed hash check.")
-                    self.requested_pieces.discard(index)
-                    self.pieces_data.pop(index, None)
-                    self.pieces_data_received.pop(index, None)
+    def add_piece(self, index, data):
+        if index in self.pieces:
+            return  # Already have this piece
+        expected_hash = self.get_piece_hash(index)
+        actual_hash = hashlib.sha1(data).digest()
+        if actual_hash == expected_hash:
+            self.pieces[index] = data
+            self.missing_pieces.discard(index)
+            self.requested_pieces.discard(index)
+            self.downloaded += len(data)
+            print(f"Piece {index} verified and added. Total downloaded: {self.downloaded} bytes.")
+        else:
+            print(f"Piece {index} failed hash check.")
+            self.requested_pieces.discard(index)  # Allow re-requesting
 
     def get_piece(self, index):
         return self.pieces.get(index)
@@ -135,23 +116,12 @@ class PieceManager:
                     return piece
         return None
 
-    def is_piece_complete(self, index):
-        """
-        Check if the piece at the given index has been fully downloaded and verified.
-        """
-        with self.lock:
-            return index in self.pieces
-
     def is_complete(self):
-        """
-        Check if all pieces have been downloaded and verified.
-        """
-        with self.lock:
-            return len(self.pieces) == self.total_pieces
+        return len(self.missing_pieces) == 0
 
     def reconstruct_files(self, base_path):
         for file_info in self.file_mappings:
-            file_path = os.path.join(base_path, *file_info['path'])  # Paths include root_directory
+            file_path = os.path.join(base_path, *file_info['path'])
             file_dir = os.path.dirname(file_path)
             if not os.path.exists(file_dir):
                 os.makedirs(file_dir)
@@ -176,7 +146,7 @@ class PieceManager:
         total_offset = 0
         total_loaded_length = 0
         for file_info in self.file_mappings:
-            file_path = os.path.join(base_path, *file_info['path'])  # Paths now include root_directory
+            file_path = os.path.join(base_path, *file_info['path'])
             if not os.path.exists(file_path):
                 print(f"File {file_path} does not exist.")
                 continue
@@ -195,15 +165,7 @@ class PieceManager:
                     if piece_index not in self.pieces_data:
                         piece_length = self.get_piece_length(piece_index)
                         self.pieces_data[piece_index] = bytearray(piece_length)
-                        self.pieces_data_received[piece_index] = [False] * piece_length
-                        if self.verbose:
-                            print(f"Initialized data structures for piece {piece_index}.")
-
                     self.pieces_data[piece_index][piece_offset:piece_offset + len(data)] = data
-
-                    # Update pieces_data_received
-                    for i in range(piece_offset, piece_offset + len(data)):
-                        self.pieces_data_received[piece_index][i] = True
 
                     total_offset += len(data)
                     total_loaded_length += len(data)
@@ -214,23 +176,15 @@ class PieceManager:
         # Proceed with verifying pieces...
 
         # After reading all files, verify and store the pieces
-        for index, piece_data in self.pieces_data.copy().items():
+        for index, piece_data in self.pieces_data.items():
             expected_hash = self.get_piece_hash(index)
             actual_hash = hashlib.sha1(piece_data).digest()
             if actual_hash == expected_hash:
                 self.pieces[index] = bytes(piece_data)
                 self.missing_pieces.discard(index)
                 print(f"Piece {index} loaded and verified.")
-                # Remove from temporary storage
-                del self.pieces_data[index]
-                self.pieces_data_received.pop(index, None)
-
             else:
                 print(f"Piece {index} failed hash check during loading.")
-                self.requested_pieces.discard(index)
-                self.pieces_data.pop(index, None)
-                self.pieces_data_received.pop(index, None)
-
         for index, piece_data in self.pieces_data.items():
             expected_length = self.get_piece_length(index)
             actual_length = len(piece_data)
@@ -240,8 +194,7 @@ class PieceManager:
         for index in range(self.total_pieces):
             if self.has_piece_in_bitfield(peer_bitfield, index):
                 self.piece_availability[index] += 1
-                if self.verbose:
-                    print(f"Piece {index} availability incremented to {self.piece_availability[index]}")
+                print(f"Piece {index} availability incremented to {self.piece_availability[index]}")
 
     def has_piece_in_bitfield(self, bitfield, index):
         byte_index = index // 8
@@ -258,11 +211,9 @@ class PieceManager:
         return index in self.pieces
 
     def get_rarest_pieces(self):
-        # Return missing pieces sorted by availability (rarest first)
+        # Return missing pieces sorted by availability
         missing_pieces = list(self.missing_pieces)
         missing_pieces.sort(key=lambda index: self.piece_availability[index])
-        if self.verbose:
-            print(f"Rarest pieces sorted: {missing_pieces}")
         return missing_pieces
 
     def get_bitfield(self):
@@ -273,3 +224,5 @@ class PieceManager:
             bit_index = index % 8
             bitfield[byte_index] |= 1 << (7 - bit_index)
         return bytes(bitfield)
+
+

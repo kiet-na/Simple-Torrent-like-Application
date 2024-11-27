@@ -223,8 +223,7 @@ class PieceManager:
                 print(f"Piece {index} loaded and verified.")
                 # Remove from temporary storage
                 del self.pieces_data[index]
-                self.pieces_data_received.pop(index, None)
-
+                del self.pieces_data_received[index]
             else:
                 print(f"Piece {index} failed hash check during loading.")
                 self.requested_pieces.discard(index)

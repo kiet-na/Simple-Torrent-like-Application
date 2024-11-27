@@ -37,9 +37,6 @@ class NodeClient:
         self.request_lock = threading.Lock()  # To synchronize access to the request queue
         self.piece_hashes = []
 
-        # Lock for thread safety when modifying connected_peers and connected_peer_addresses
-        self.lock = threading.Lock()
-
         # Tracker URL (Assuming it's in the .torrent file)
         self.tracker_url = None
 
@@ -71,11 +68,7 @@ class NodeClient:
             return False
 
         with open(torrent_path, 'rb') as tf:
-            try:
-                metainfo = bencodepy.decode(tf.read())
-            except bencodepy.exceptions.DecodingError as e:
-                print(f"DecodingError while parsing torrent file: {e}")
-                return False
+            metainfo = bencodepy.decode(tf.read())
 
         self.metainfo = metainfo  # Keys are bytes
 
@@ -89,43 +82,37 @@ class NodeClient:
         pieces = self.metainfo[b'info'][b'pieces']
         self.piece_hashes = [pieces[i:i + 20] for i in range(0, len(pieces), 20)]
 
-        self.piece_manager = PieceManager(self.metainfo, self.download_directory, verbose=self.verbose)
+        self.piece_manager = PieceManager(self.metainfo, self.download_directory)
         self.piece_manager.piece_hashes = self.piece_hashes
 
         # Construct the file path for the shared file/directory
         file_name = self.metainfo[b'info'][b'name'].decode('utf-8')
         file_path = os.path.join(self.download_directory, file_name)
 
-        if os.path.exists(self.download_directory):
-            print(f"{self.role.capitalize()}: File {self.download_directory} exists locally. Loading pieces...")
+        if os.path.exists(file_path):
+            print(f"{self.role.capitalize()}: File {file_path} exists locally. Loading pieces...")
             self.piece_manager.load_pieces_from_file(self.download_directory)
         else:
             if self.role == 'seeder':
-                print(f"Seeder: File {self.download_directory} does not exist locally. Cannot seed.")
+                print(f"Seeder: File {file_path} does not exist locally. Cannot seed.")
                 return False
             else:
-                print(f"Leecher: File {self.download_directory} does not exist locally. Starting download...")
+                print(f"Leecher: File {file_path} does not exist locally. Starting download...")
         return True
 
     def listen_for_peers(self):
-        try:
-            self.server_socket.bind(('', self.listen_port))
-            self.server_socket.listen(5)
-            if self.verbose:
-                print(f"Listening for peers on port {self.listen_port}...")
-        except Exception as e:
-            print(f"Failed to bind to port {self.listen_port}: {e}")
-            return
-
+        self.server_socket.bind(('', self.listen_port))
+        self.server_socket.listen(5)
+        if self.verbose:
+            print(f"Listening for peers on port {self.listen_port}...")
         while self.running:
             try:
                 client_socket, addr = self.server_socket.accept()
                 if self.verbose:
                     print(f"Accepted connection from {addr}")
-                peer_conn = PeerConnection.from_incoming(client_socket, self.piece_manager, self.peer_id, self.info_hash, self, verbose=self.verbose)
+                peer_conn = PeerConnection.from_incoming(client_socket, self.piece_manager, self.peer_id, self.info_hash, self)
                 peer_conn.start()
-                with self.lock:
-                    self.connected_peers.append(peer_conn)
+                self.connected_peers.append(peer_conn)
                 # Note: Peer ID is not known yet; will be updated after handshake
             except Exception as e:
                 if self.verbose:
@@ -200,15 +187,15 @@ class NodeClient:
                     time.sleep(10)  # Keep the seeder running
 
     def populate_request_queue(self):
-        while not self.piece_manager.is_complete() and self.running:
+        while not self.piece_manager.is_complete():
             with self.piece_manager.lock:
                 rarest_pieces = self.piece_manager.get_rarest_pieces()
                 for index in rarest_pieces:
                     if index not in self.piece_manager.requested_pieces and index not in self.piece_manager.pieces:
+                        # PriorityQueue uses the first element of the tuple for sorting
+                        # Lower priority number means higher priority (rarest first)
                         priority = self.piece_manager.piece_availability[index]
                         self.request_queue.put((priority, index))
-                        if self.verbose:
-                            print(f"Added piece {index} with priority {priority} to the request queue.")
             time.sleep(5)
 
     def connect_to_peers_loop(self):
@@ -222,56 +209,40 @@ class NodeClient:
             port = int(peer_info.get('port'))
 
             peer_address = (ip, port)
-            with self.lock:
-                if peer_address in self.connected_peer_addresses:
-                    if self.verbose:
-                        print(f"Already connected to peer at {ip}:{port}")
-                    continue
+            if peer_address in self.connected_peer_addresses:
+                if self.verbose:
+                    print(f"Already connected to peer at {ip}:{port}")
+                continue
 
             if self.verbose:
                 print(f"Connecting to peer {ip}:{port}")
-            try:
-                peer_conn = PeerConnection(ip, port, self.piece_manager, self.peer_id, self.info_hash, self, verbose=self.verbose)
-                peer_conn.start()
-                with self.lock:
-                    self.connected_peers.append(peer_conn)
-                    self.connected_peer_addresses.add(peer_address)
-                if self.verbose:
-                    print(f"Connected to peer {ip}:{port}")
-            except Exception as e:
-                if self.verbose:
-                    print(f"Failed to connect to peer {ip}:{port} - {e}")
+            peer_conn = PeerConnection(ip, port, self.piece_manager, self.peer_id, self.info_hash, self)
+            peer_conn.start()
+            self.connected_peers.append(peer_conn)
+            self.connected_peer_addresses.add(peer_address)
 
     def request_piece_from_rarest(self):
         try:
             priority, piece_index = self.request_queue.get(timeout=10)
             with self.request_lock:
                 if piece_index in self.piece_manager.requested_pieces or piece_index in self.piece_manager.pieces:
-                    if self.verbose:
-                        print(f"Piece {piece_index} already requested or downloaded. Skipping.")
                     return None  # Already requested or downloaded
                 self.piece_manager.requested_pieces.add(piece_index)
-                if self.verbose:
-                    print(f"Requesting piece {piece_index} with priority {priority}.")
                 return piece_index
         except Empty:
-            if self.verbose:
-                print("Request queue is empty. No pieces to request.")
             return None  # No pieces available to request
 
     def notify_piece_downloaded(self, piece_index):
         with self.request_lock:
             # Update piece availability since a new peer now has this piece
             self.piece_manager.piece_availability[piece_index] += 1
-            if self.verbose:
-                print(f"Piece {piece_index} is now available with availability {self.piece_manager.piece_availability[piece_index]}.")
             # Re-populate the queue as piece availability might have changed
-            # This might be redundant if 'populate_request_queue' is running continuously
+            self.populate_request_queue()
 
     def display_statistics(self):
         previous_downloaded = 0
         previous_uploaded = 0
-        while not self.piece_manager.is_complete() and self.running:
+        while not self.piece_manager.is_complete():
             time.sleep(1)
             downloaded = self.piece_manager.downloaded
             uploaded = self.piece_manager.uploaded
@@ -282,3 +253,4 @@ class NodeClient:
             progress = (len(self.piece_manager.pieces) / self.piece_manager.total_pieces) * 100
             print(f"\rProgress: {progress:.2f}% | Downloaded: {downloaded} bytes ({download_speed} B/s) | Uploaded: {uploaded} bytes ({upload_speed} B/s)", end='')
         print("\nDownload statistics display terminated.")
+
