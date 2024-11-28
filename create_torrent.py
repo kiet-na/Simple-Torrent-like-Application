@@ -19,9 +19,11 @@ def get_files_info(base_path):
             # Get the relative path components
             relative_path = os.path.relpath(filepath, base_path)
             path_components = relative_path.split(os.sep)
+            # Encode each path component to bytes
+            path_components_bytes = [component.encode('utf-8') for component in path_components]
             files.append({
-                'length': length,
-                'path': path_components
+                b'length': length,
+                b'path': path_components_bytes
             })
     return files
 
@@ -35,7 +37,7 @@ def create_torrent(directory_path, tracker_url, torrent_path):
     # Read all files and compute piece hashes
     file_contents = b''
     for file_info in files_info:
-        filepath = os.path.join(directory_path, *file_info['path'])
+        filepath = os.path.join(directory_path, *[component.decode('utf-8') for component in file_info[b'path']])
         with open(filepath, 'rb') as f:
             file_contents += f.read()
 
@@ -44,13 +46,14 @@ def create_torrent(directory_path, tracker_url, torrent_path):
         piece = file_contents[i:i + piece_length]
         pieces += sha1_hash(piece)
 
+    # Construct the torrent dictionary with byte string keys and values
     torrent = {
-        'announce': tracker_url,
-        'info': {
-            'name': os.path.basename(directory_path),
-            'piece length': piece_length,
-            'pieces': pieces,
-            'files': files_info
+        b'announce': tracker_url.encode('utf-8'),
+        b'info': {
+            b'name': os.path.basename(directory_path).encode('utf-8'),
+            b'piece length': piece_length,
+            b'pieces': pieces,
+            b'files': files_info
         }
     }
 
