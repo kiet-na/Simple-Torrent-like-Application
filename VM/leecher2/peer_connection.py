@@ -7,6 +7,7 @@ import socket
 import sys
 import time
 
+# Message IDs
 MESSAGE_CHOKE = 0
 MESSAGE_UNCHOKE = 1
 MESSAGE_INTERESTED = 2
@@ -129,12 +130,13 @@ class PeerConnection(threading.Thread):
                 if self.verbose:
                     print(f"Received BITFIELD from peer {self.ip}:{self.port}")
 
-        # Send our BITFIELD after handshake
-        bitfield = self.piece_manager.get_bitfield()
-        if bitfield:
-            self.send_message(MESSAGE_BITFIELD, bitfield)
-            if self.verbose:
-                print(f"Sent BITFIELD to peer {self.ip}:{self.port}")
+        # Send our BITFIELD after handshake if not already sent
+        if not self.is_incoming:
+            bitfield = self.piece_manager.get_bitfield()
+            if bitfield:
+                self.send_message(MESSAGE_BITFIELD, bitfield)
+                if self.verbose:
+                    print(f"Sent BITFIELD to peer {self.ip}:{self.port}")
 
     def keep_alive(self):
         while self.running:
@@ -173,10 +175,10 @@ class PeerConnection(threading.Thread):
             msg = struct.pack('!I', msg_length) + struct.pack('!B', msg_id) + payload
             self.socket.sendall(msg)
             if self.verbose:
-                print(f"Sent message ID {msg_id} to {self.ip}:{self.port}")
+                print(f"Sent message ID {msg_id} to peer {self.ip}:{self.port}")
         except Exception as e:
             if self.verbose:
-                print(f"Failed to send message ID {msg_id} to {self.ip}:{self.port} - {e}")
+                print(f"Failed to send message ID {msg_id} to peer {self.ip}:{self.port} - {e}")
             self.running = False
 
     def receive_message(self):

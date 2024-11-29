@@ -19,8 +19,8 @@ class NodeClient:
         self.torrent_file = torrent_file
         self.listen_port = listen_port
         self.download_directory = download_directory
-        self.max_download_speed = max_download_speed  # Bytes per second
-        self.max_upload_speed = max_upload_speed      # Bytes per second
+        self.max_download_speed = max_download_speed  # Bytes per second (Not implemented)
+        self.max_upload_speed = max_upload_speed      # Bytes per second (Not implemented)
         self.verbose = verbose
         self.role = role  # 'seeder' or 'leecher'
 
@@ -39,9 +39,6 @@ class NodeClient:
 
         # Lock for thread safety when modifying connected_peers and connected_peer_addresses
         self.lock = threading.Lock()
-
-        # Tracker URL (Assuming it's in the .torrent file)
-        self.tracker_url = None
 
     def generate_peer_id(self):
         # Ensure peer_id is exactly 20 characters
@@ -90,21 +87,22 @@ class NodeClient:
         self.piece_hashes = [pieces[i:i + 20] for i in range(0, len(pieces), 20)]
 
         self.piece_manager = PieceManager(self.metainfo, self.download_directory, verbose=self.verbose)
-        self.piece_manager.piece_hashes = self.piece_hashes
+
+        # No need to assign piece_hashes separately since PieceManager retrieves them from metainfo
 
         # Construct the file path for the shared file/directory
         file_name = self.metainfo[b'info'][b'name'].decode('utf-8')
         file_path = os.path.join(self.download_directory, file_name)
 
         if os.path.exists(self.download_directory):
-            print(f"{self.role.capitalize()}: File {self.download_directory} exists locally. Loading pieces...")
+            print(f"{self.role.capitalize()}: Directory {self.download_directory} exists locally. Loading pieces...")
             self.piece_manager.load_pieces_from_file(self.download_directory)
         else:
             if self.role == 'seeder':
-                print(f"Seeder: File {self.download_directory} does not exist locally. Cannot seed.")
+                print(f"Seeder: Directory {self.download_directory} does not exist locally. Cannot seed.")
                 return False
             else:
-                print(f"Leecher: File {self.download_directory} does not exist locally. Starting download...")
+                print(f"Leecher: Directory {self.download_directory} does not exist locally. Starting download...")
         return True
 
     def listen_for_peers(self):

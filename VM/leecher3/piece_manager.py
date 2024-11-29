@@ -103,13 +103,13 @@ class PieceManager:
                     self.pieces_data_received.pop(index, None)  # Safe removal
                     self.missing_pieces.discard(index)
                     self.requested_pieces.discard(index)
-                    self.downloaded += piece_length
+                    self.downloaded += self.get_piece_length(index)
                     print(f"Piece {index} verified and added. Total downloaded: {self.downloaded} bytes.")
                 else:
-                    print(f"Piece {index} failed hash check.")
+                    print(f"Piece {index} failed hash check. Expected {expected_hash.hex()}, got {actual_hash.hex()}.")
                     self.requested_pieces.discard(index)
-                    self.pieces_data.pop(index, None)
-                    self.pieces_data_received.pop(index, None)
+                    del self.pieces_data[index]
+                    del self.pieces_data_received[index]
 
     def get_piece(self, index):
         return self.pieces.get(index)
@@ -166,7 +166,7 @@ class PieceManager:
                     if piece_data is None:
                         print(f"Missing piece {piece_index}, cannot reconstruct file.")
                         return
-                    read_length = min(remaining, self.piece_length - piece_offset)
+                    read_length = min(remaining, self.get_piece_length(piece_index) - piece_offset)
                     outfile.write(piece_data[piece_offset:piece_offset + read_length])
                     file_offset += read_length
                     remaining -= read_length
@@ -209,12 +209,12 @@ class PieceManager:
                     total_loaded_length += len(data)
                     remaining -= len(data)
 
-        print(f"Total loaded data length: {total_loaded_length}")
-        print(f"Expected total length: {self.total_length}")
+        print(f"Total loaded data length: {total_loaded_length} bytes")
+        print(f"Expected total length: {self.total_length} bytes")
         # Proceed with verifying pieces...
 
         # After reading all files, verify and store the pieces
-        for index, piece_data in self.pieces_data.copy().items():
+        for index, piece_data in list(self.pieces_data.items()):
             expected_hash = self.get_piece_hash(index)
             actual_hash = hashlib.sha1(piece_data).digest()
             if actual_hash == expected_hash:
@@ -225,10 +225,10 @@ class PieceManager:
                 del self.pieces_data[index]
                 del self.pieces_data_received[index]
             else:
-                print(f"Piece {index} failed hash check during loading.")
+                print(f"Piece {index} failed hash check during loading. Expected {expected_hash.hex()}, got {actual_hash.hex()}.")
                 self.requested_pieces.discard(index)
-                self.pieces_data.pop(index, None)
-                self.pieces_data_received.pop(index, None)
+                del self.pieces_data[index]
+                del self.pieces_data_received[index]
 
         for index, piece_data in self.pieces_data.items():
             expected_length = self.get_piece_length(index)
