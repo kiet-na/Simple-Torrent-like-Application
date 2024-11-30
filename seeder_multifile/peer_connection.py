@@ -6,7 +6,7 @@ import struct
 import socket
 import sys
 import time
-
+MAX_CONCURRENT_REQUESTS = 5  # Example limit
 MESSAGE_CHOKE = 0
 MESSAGE_UNCHOKE = 1
 MESSAGE_INTERESTED = 2
@@ -36,7 +36,7 @@ class PeerConnection(threading.Thread):
         self.peer_choking = True
         self.peer_interested = False
         self.verbose = verbose
-
+        self.current_requests = 0
         if not self.is_incoming:
             if sock is None:
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -252,7 +252,10 @@ class PeerConnection(threading.Thread):
                 print(f"Unknown message ID: {msg_id}")
 
     def request_pieces(self):
-        while not self.piece_manager.is_complete() and self.am_interested and not self.peer_choking:
+        while (not self.piece_manager.is_complete() and
+               self.am_interested and
+               not self.peer_choking and
+               self.current_requests < MAX_CONCURRENT_REQUESTS):
             piece_index = self.client.request_piece_from_rarest()
             if piece_index is None:
                 break
@@ -266,6 +269,7 @@ class PeerConnection(threading.Thread):
             # Send request message
             payload = struct.pack('!III', piece_index, begin, length)
             self.send_message(MESSAGE_REQUEST, payload)
+            self.current_requests += 1
             if self.verbose:
                 print(f"Requested piece {piece_index} from {self.ip}:{self.port}")
 
@@ -298,14 +302,18 @@ class PeerConnection(threading.Thread):
             # Potentially request more pieces
             if not self.peer_choking:
                 self.request_pieces()
+                self.current_requests -= 1
 
     def handle_request(self, payload):
         piece_index, begin, length = struct.unpack('!III', payload)
-        if not self.am_choking:
+        if not self.am_choking and self.has_piece(piece_index):
             self.send_piece(piece_index, begin, length)
+            if self.verbose:
+                print(f"Sent piece {piece_index} to peer {self.ip}:{self.port}")
         else:
             if self.verbose:
-                print(f"Cannot send piece {piece_index} because we are choking the peer.")
+                print(
+                    f"Cannot send piece {piece_index} to peer {self.ip}:{self.port} because we are choking or don't have the piece.")
 
     def send_piece(self, piece_index, begin, length):
         try:
