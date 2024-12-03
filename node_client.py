@@ -13,6 +13,7 @@ import bencodepy
 import hashlib
 import sys
 from queue import PriorityQueue, Empty
+import urllib.parse  # Added for URL encoding
 
 class NodeClient:
     def __init__(self, torrent_file, listen_port, download_directory, max_download_speed=0, max_upload_speed=0, verbose=False, role='leecher'):
@@ -43,12 +44,23 @@ class NodeClient:
         # Tracker URL (Assuming it's in the .torrent file)
         self.tracker_url = None
 
+        # External IP
+        self.external_ip = self.get_external_ip()
+
     def generate_peer_id(self):
         # Ensure peer_id is exactly 20 characters
         peer_id = '-PC0001-' + ''.join(random.choices(string.digits, k=12))
         if len(peer_id) != 20:
             raise ValueError(f"peer_id length is {len(peer_id)}, expected 20.")
         return peer_id
+
+    def get_external_ip(self):
+        try:
+            # Use an external service to fetch the external IP
+            return requests.get('https://api.ipify.org').text
+        except Exception as e:
+            print(f"Failed to retrieve external IP: {e}")
+            return '127.0.0.1'
 
     def start(self):
         if not self.load_torrent(self.torrent_file):
@@ -96,15 +108,16 @@ class NodeClient:
         file_name = self.metainfo[b'info'][b'name'].decode('utf-8')
         file_path = os.path.join(self.download_directory, file_name)
 
-        if os.path.exists(self.download_directory):
-            print(f"{self.role.capitalize()}: File {self.download_directory} exists locally. Loading pieces...")
+        if os.path.exists(file_path):
+            print(f"{self.role.capitalize()}: File {file_path} exists locally. Loading pieces...")
             self.piece_manager.load_pieces_from_file(self.download_directory)
+            self.piece_manager.initialize_piece_availability()  # Initialize own pieces
         else:
             if self.role == 'seeder':
-                print(f"Seeder: File {self.download_directory} does not exist locally. Cannot seed.")
+                print(f"Seeder: File {file_path} does not exist locally. Cannot seed.")
                 return False
             else:
-                print(f"Leecher: File {self.download_directory} does not exist locally. Starting download...")
+                print(f"Leecher: File {file_path} does not exist locally. Starting download...")
         return True
 
     def listen_for_peers(self):
@@ -132,9 +145,12 @@ class NodeClient:
                     print(f"Error accepting connections: {e}")
 
     def announce_to_tracker(self, event):
+        # URL-encode info_hash and peer_id
+        encoded_info_hash = urllib.parse.quote_from_bytes(self.info_hash)
+        encoded_peer_id = urllib.parse.quote(self.peer_id)
         params = {
-            'info_hash': self.info_hash,
-            'peer_id': self.peer_id.encode('utf-8'),
+            'info_hash': encoded_info_hash,
+            'peer_id': encoded_peer_id,
             'port': self.listen_port,
             'uploaded': self.piece_manager.uploaded,
             'downloaded': self.piece_manager.downloaded,
@@ -220,6 +236,12 @@ class NodeClient:
         for peer_info in self.peers:
             ip = peer_info.get('ip')
             port = int(peer_info.get('port'))
+
+            # Prevent connecting to self
+            if ip == self.external_ip and port == self.listen_port:
+                if self.verbose:
+                    print(f"Skipping self connection to {ip}:{port}")
+                continue
 
             peer_address = (ip, port)
             with self.lock:

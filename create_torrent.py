@@ -1,72 +1,60 @@
 # create_torrent.py
 
+import os
 import bencodepy
 import hashlib
-import sys
-import os
-
-def sha1_hash(data):
-    hasher = hashlib.sha1()
-    hasher.update(data)
-    return hasher.digest()
-
-def get_files_info(base_path):
-    files = []
-    for root, dirs, filenames in os.walk(base_path):
-        for filename in filenames:
-            filepath = os.path.join(root, filename)
-            length = os.path.getsize(filepath)
-            # Get the relative path components
-            relative_path = os.path.relpath(filepath, base_path)
-            path_components = relative_path.split(os.sep)
-            # Encode each path component to bytes
-            path_components_bytes = [component.encode('utf-8') for component in path_components]
-            files.append({
-                b'length': length,
-                b'path': path_components_bytes
-            })
-    return files
 
 def create_torrent(directory_path, tracker_url, torrent_path):
-    piece_length = 524288  # 512 KB
-    pieces = b''
+    files = []
+    total_length = 0
 
-    # Get all files in the directory
-    files_info = get_files_info(directory_path)
+    # Handle single and multi-file torrents
+    if os.path.isdir(directory_path):
+        for root, dirs, filenames in os.walk(directory_path):
+            for filename in filenames:
+                filepath = os.path.join(root, filename)
+                file_info = {
+                    b'length': os.path.getsize(filepath),
+                    b'path': [component.encode('utf-8') for component in os.path.relpath(filepath, directory_path).split(os.sep)]
+                }
+                files.append(file_info)
+                total_length += file_info[b'length']
+    else:
+        file_info = {
+            b'length': os.path.getsize(directory_path),
+            b'name': os.path.basename(directory_path).encode('utf-8')
+        }
+        total_length = file_info[b'length']
 
-    # Read all files and compute piece hashes
-    file_contents = b''
-    for file_info in files_info:
-        filepath = os.path.join(directory_path, *[component.decode('utf-8') for component in file_info[b'path']])
-        with open(filepath, 'rb') as f:
-            file_contents += f.read()
+    info = {
+        b'name': os.path.basename(directory_path).encode('utf-8'),
+        b'piece length': 524288,  # 512 KiB
+    }
 
-    # Calculate piece hashes
-    for i in range(0, len(file_contents), piece_length):
-        piece = file_contents[i:i + piece_length]
-        pieces += sha1_hash(piece)
+    if files:
+        info[b'files'] = files
+    else:
+        info[b'length'] = total_length
 
-    # Construct the torrent dictionary with byte string keys and values
+    # Compute piece hashes
+    # Implement piece hashing logic here if needed
+
     torrent = {
         b'announce': tracker_url.encode('utf-8'),
-        b'info': {
-            b'name': os.path.basename(directory_path).encode('utf-8'),
-            b'piece length': piece_length,
-            b'pieces': pieces,
-            b'files': files_info
-        }
+        b'info': info
     }
 
     with open(torrent_path, 'wb') as tf:
         tf.write(bencodepy.encode(torrent))
-
-    print(f"Created multi-file torrent at {torrent_path}")
+    print(f"Torrent file created at {torrent_path}")
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4:
-        print("Usage: python create_torrent.py <directory_path> <tracker_url> <torrent_path>")
-        sys.exit(1)
-    directory_path = sys.argv[1]
-    tracker_url = sys.argv[2]
-    torrent_path = sys.argv[3]
-    create_torrent(directory_path, tracker_url, torrent_path)
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Create a .torrent file.')
+    parser.add_argument('directory', help='Directory or file to create torrent from')
+    parser.add_argument('tracker', help='Tracker URL (e.g., http://localhost:8000/announce)')
+    parser.add_argument('output', help='Output torrent file path')
+
+    args = parser.parse_args()
+    create_torrent(args.directory, args.tracker, args.output)

@@ -116,10 +116,13 @@ class PeerConnection(threading.Thread):
                 raise Exception("Info hash does not match")
             self.remote_peer_id = received_peer_id
 
-            # Send handshake
-            self.socket.sendall(handshake_msg)
-            if self.verbose:
-                print(f"Accepted connection from {self.ip}:{self.port} with peer_id {self.remote_peer_id}")
+            # Send handshake back
+            try:
+                self.socket.sendall(handshake_msg)
+                if self.verbose:
+                    print(f"Sent handshake to peer {self.ip}:{self.port}")
+            except Exception as e:
+                raise Exception(f"Failed to send handshake: {e}")
 
             # Receive BITFIELD
             msg_id, payload = self.receive_message()
@@ -127,7 +130,7 @@ class PeerConnection(threading.Thread):
                 self.bitfield = payload
                 self.piece_manager.update_piece_availability(self.bitfield)
                 if self.verbose:
-                    print(f"Received BITFIELD from peer {self.ip}:{self.port}")
+                    print(f"Received BITFIELD from peer {self.ip}:{self.port}.")
 
         # Send our BITFIELD after handshake
         bitfield = self.piece_manager.get_bitfield()

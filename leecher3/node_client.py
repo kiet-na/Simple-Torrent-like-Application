@@ -23,7 +23,8 @@ class NodeClient:
         self.max_upload_speed = max_upload_speed      # Bytes per second
         self.verbose = verbose
         self.role = role  # 'seeder' or 'leecher'
-
+        self.request_timestamps = {}
+        self.request_timeout = 30  # seconds
         self.running = True
         self.peers = []
         self.peer_id = self.generate_peer_id()
@@ -36,7 +37,7 @@ class NodeClient:
         self.request_queue = PriorityQueue()  # PriorityQueue to manage Rarest First
         self.request_lock = threading.Lock()  # To synchronize access to the request queue
         self.piece_hashes = []
-
+        self.requested_pieces = set()
         # Lock for thread safety when modifying connected_peers and connected_peer_addresses
         self.lock = threading.Lock()
 
@@ -62,6 +63,7 @@ class NodeClient:
         self.announce_to_tracker(event='started')
 
         # Start main loop
+        threading.Thread(target=self.handle_piece_download_timeout, daemon=True).start()  # New thread
         self.main_loop()
 
     def load_torrent(self, torrent_path):
@@ -204,11 +206,12 @@ class NodeClient:
             with self.piece_manager.lock:
                 rarest_pieces = self.piece_manager.get_rarest_pieces()
                 for index in rarest_pieces:
-                    if index not in self.piece_manager.requested_pieces and index not in self.piece_manager.pieces:
-                        priority = self.piece_manager.piece_availability[index]
-                        self.request_queue.put((priority, index))
-                        if self.verbose:
-                            print(f"Added piece {index} with priority {priority} to the request queue.")
+                    if index not in self.piece_manager.pieces:
+                        if index not in self.piece_manager.requested_pieces:
+                            priority = self.piece_manager.piece_availability[index]
+                            self.request_queue.put((priority, index))
+                            if self.verbose:
+                                print(f"Added piece {index} with priority {priority} to the request queue.")
             time.sleep(5)
 
     def connect_to_peers_loop(self):
@@ -246,18 +249,37 @@ class NodeClient:
         try:
             priority, piece_index = self.request_queue.get(timeout=10)
             with self.request_lock:
-                if piece_index in self.piece_manager.requested_pieces or piece_index in self.piece_manager.pieces:
-                    if self.verbose:
-                        print(f"Piece {piece_index} already requested or downloaded. Skipping.")
-                    return None  # Already requested or downloaded
-                self.piece_manager.requested_pieces.add(piece_index)
+                current_time = time.time()
+                # Check if the piece was requested recently
+                if (piece_index in self.requested_pieces and
+                        current_time - self.request_timestamps.get(piece_index, 0) < self.request_timeout):
+                    # Re-add the piece to the queue for retry
+                    self.request_queue.put((priority, piece_index))
+                    return None
+                self.requested_pieces.add(piece_index)
+                self.request_timestamps[piece_index] = current_time
                 if self.verbose:
                     print(f"Requesting piece {piece_index} with priority {priority}.")
                 return piece_index
         except Empty:
             if self.verbose:
                 print("Request queue is empty. No pieces to request.")
-            return None  # No pieces available to request
+            return None
+
+    def handle_piece_download_timeout(self):
+        while self.running:
+            time.sleep(10)  # Check every 10 seconds
+            current_time = time.time()
+            with self.request_lock:
+                for piece_index in list(self.requested_pieces):
+                    if current_time - self.request_timestamps.get(piece_index, 0) > self.request_timeout:
+                        if self.verbose:
+                            print(f"Timeout for piece {piece_index}. Re-adding to request queue.")
+                        self.requested_pieces.discard(piece_index)
+                        self.request_timestamps.pop(piece_index, None)
+                        priority = self.piece_manager.piece_availability[piece_index]
+                        self.request_queue.put((priority, piece_index))
+            # No need to lock during sleep
 
     def notify_piece_downloaded(self, piece_index):
         with self.request_lock:
@@ -265,6 +287,9 @@ class NodeClient:
             self.piece_manager.piece_availability[piece_index] += 1
             if self.verbose:
                 print(f"Piece {piece_index} is now available with availability {self.piece_manager.piece_availability[piece_index]}.")
+            # Remove the piece from requested_pieces and request_timestamps
+            self.requested_pieces.discard(piece_index)
+            self.request_timestamps.pop(piece_index, None)
             # Re-populate the queue as piece availability might have changed
             # This might be redundant if 'populate_request_queue' is running continuously
 
