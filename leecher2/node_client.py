@@ -2,7 +2,6 @@
 
 import threading
 import socket
-import requests
 import time
 import os
 import random
@@ -13,6 +12,8 @@ import bencodepy
 import hashlib
 import sys
 from queue import PriorityQueue, Empty
+import urllib.parse
+import requests
 
 class NodeClient:
     def __init__(self, torrent_file, listen_port, download_directory, max_download_speed=0, max_upload_speed=0, verbose=False, role='leecher'):
@@ -23,7 +24,8 @@ class NodeClient:
         self.max_upload_speed = max_upload_speed      # Bytes per second
         self.verbose = verbose
         self.role = role  # 'seeder' or 'leecher'
-
+        self.request_timestamps = {}
+        self.request_timeout = 30  # seconds
         self.running = True
         self.peers = []
         self.peer_id = self.generate_peer_id()
@@ -36,15 +38,17 @@ class NodeClient:
         self.request_queue = PriorityQueue()  # PriorityQueue to manage Rarest First
         self.request_lock = threading.Lock()  # To synchronize access to the request queue
         self.piece_hashes = []
-
+        self.requested_pieces = set()
         # Lock for thread safety when modifying connected_peers and connected_peer_addresses
         self.lock = threading.Lock()
 
         # Tracker URL (Assuming it's in the .torrent file)
         self.tracker_url = None
 
+        self.has_announced_started = False  # To track if 'started' event has been sent
+
     def generate_peer_id(self):
-        # Ensure peer_id is exactly 20 characters
+        # Ensure peer_id is exactly 20 bytes
         peer_id = '-PC0001-' + ''.join(random.choices(string.digits, k=12))
         if len(peer_id) != 20:
             raise ValueError(f"peer_id length is {len(peer_id)}, expected 20.")
@@ -58,14 +62,11 @@ class NodeClient:
         # Start listening for peers (both seeders and leechers)
         threading.Thread(target=self.listen_for_peers, daemon=True).start()
 
-        # Announce to tracker
-        self.announce_to_tracker(event='started')
-
         # Start main loop
+        threading.Thread(target=self.handle_piece_download_timeout, daemon=True).start()
         self.main_loop()
 
     def load_torrent(self, torrent_path):
-        # Adjusted to use the provided torrent file path
         if not os.path.exists(torrent_path):
             print(f"Torrent file {torrent_path} does not exist.")
             return False
@@ -86,25 +87,18 @@ class NodeClient:
         info = self.metainfo[b'info']
         encoded_info = bencodepy.encode(info)
         self.info_hash = hashlib.sha1(encoded_info).digest()  # Use raw bytes
-        pieces = self.metainfo[b'info'][b'pieces']
-        self.piece_hashes = [pieces[i:i + 20] for i in range(0, len(pieces), 20)]
 
         self.piece_manager = PieceManager(self.metainfo, self.download_directory, verbose=self.verbose)
-        self.piece_manager.piece_hashes = self.piece_hashes
 
-        # Construct the file path for the shared file/directory
-        file_name = self.metainfo[b'info'][b'name'].decode('utf-8')
-        file_path = os.path.join(self.download_directory, file_name)
-
-        if os.path.exists(self.download_directory):
-            print(f"{self.role.capitalize()}: File {self.download_directory} exists locally. Loading pieces...")
-            self.piece_manager.load_pieces_from_file(self.download_directory)
+        # If role is 'seeder', load existing pieces
+        if self.role == 'seeder':
+            if self.verbose:
+                print(f"Seeder: Loading existing pieces from {self.download_directory}")
+            self.piece_manager.load_pieces_from_file()
         else:
-            if self.role == 'seeder':
-                print(f"Seeder: File {self.download_directory} does not exist locally. Cannot seed.")
-                return False
-            else:
-                print(f"Leecher: File {self.download_directory} does not exist locally. Starting download...")
+            if self.verbose:
+                print(f"Leecher: Starting download to {self.download_directory}")
+
         return True
 
     def listen_for_peers(self):
@@ -126,12 +120,11 @@ class NodeClient:
                 peer_conn.start()
                 with self.lock:
                     self.connected_peers.append(peer_conn)
-                # Note: Peer ID is not known yet; will be updated after handshake
             except Exception as e:
                 if self.verbose:
                     print(f"Error accepting connections: {e}")
 
-    def announce_to_tracker(self, event):
+    def announce_to_tracker(self, event=None):
         params = {
             'info_hash': self.info_hash,
             'peer_id': self.peer_id.encode('utf-8'),
@@ -139,10 +132,16 @@ class NodeClient:
             'uploaded': self.piece_manager.uploaded,
             'downloaded': self.piece_manager.downloaded,
             'left': self.piece_manager.total_length - self.piece_manager.downloaded,
-            'event': event
         }
+        if event:
+            params['event'] = event
+
+        # Properly URL-encode the parameters
+        encoded_params = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+        announce_url = f"{self.tracker_url}?{encoded_params}"
+
         try:
-            response = requests.get(self.tracker_url, params=params)
+            response = requests.get(announce_url)
             if response.status_code == 200:
                 data = bencodepy.decode(response.content)
                 peers = data.get(b'peers')
@@ -169,63 +168,62 @@ class NodeClient:
         return peers
 
     def main_loop(self):
-        if self.role == 'seeder':
-            print("Seeder is ready to upload to peers.")
-            while self.running:
-                time.sleep(10)  # Keep the seeder running
-        else:
-            # Initialize the request queue with rarest pieces first
-            threading.Thread(target=self.populate_request_queue, daemon=True).start()
+        # Start initial tracker announce
+        if not self.has_announced_started:
+            self.announce_to_tracker(event='started')
+            self.has_announced_started = True
 
-            # Start connecting to peers
-            threading.Thread(target=self.connect_to_peers_loop, daemon=True).start()
+        # Start threads
+        threading.Thread(target=self.populate_request_queue, daemon=True).start()
+        threading.Thread(target=self.connect_to_peers_loop, daemon=True).start()
+        threading.Thread(target=self.display_statistics, daemon=True).start()
+        threading.Thread(target=self.periodic_tracker_announce, daemon=True).start()
 
-            # Start displaying statistics
-            threading.Thread(target=self.display_statistics, daemon=True).start()
-
-            # Keep the main thread alive
-            while self.running and not self.piece_manager.is_complete():
-                time.sleep(1)
-            if self.piece_manager.is_complete():
+        while self.running:
+            if self.role == 'leecher' and self.piece_manager.is_complete():
                 print("\nDownload complete.")
                 # Reconstruct the files
-                self.piece_manager.reconstruct_files(self.download_directory)
+                self.piece_manager.reconstruct_files()
                 self.announce_to_tracker(event='completed')
                 print(f"Downloaded: {self.piece_manager.downloaded} bytes")
                 print(f"Uploaded: {self.piece_manager.uploaded} bytes")
                 print("Now acting as seeder. Ready to upload to peers.")
                 self.role = 'seeder'
-                # Continue running as seeder
-                while self.running:
-                    time.sleep(10)  # Keep the seeder running
+            time.sleep(1)
+
+    def periodic_tracker_announce(self):
+        while self.running:
+            time.sleep(1800)  # Announce every 30 minutes
+            self.announce_to_tracker()
 
     def populate_request_queue(self):
-        while not self.piece_manager.is_complete() and self.running:
-            with self.piece_manager.lock:
-                rarest_pieces = self.piece_manager.get_rarest_pieces()
-                for index in rarest_pieces:
-                    if index not in self.piece_manager.requested_pieces and index not in self.piece_manager.pieces:
-                        priority = self.piece_manager.piece_availability[index]
-                        self.request_queue.put((priority, index))
-                        if self.verbose:
-                            print(f"Added piece {index} with priority {priority} to the request queue.")
+        while self.running:
+            if self.role == 'leecher':
+                with self.piece_manager.lock:
+                    rarest_pieces = self.piece_manager.get_rarest_pieces()
+                    for index in rarest_pieces:
+                        if index not in self.piece_manager.pieces:
+                            if index not in self.requested_pieces:
+                                priority = self.piece_manager.piece_availability[index]
+                                self.request_queue.put((priority, index))
+                                if self.verbose:
+                                    print(f"Added piece {index} with priority {priority} to the request queue.")
             time.sleep(5)
 
     def connect_to_peers_loop(self):
-        while self.running and not self.piece_manager.is_complete():
+        while self.running:
             self.connect_to_peers()
             time.sleep(30)  # Attempt to connect every 30 seconds
 
     def connect_to_peers(self):
+        self.announce_to_tracker()
         for peer_info in self.peers:
             ip = peer_info.get('ip')
             port = int(peer_info.get('port'))
 
             peer_address = (ip, port)
             with self.lock:
-                if peer_address in self.connected_peer_addresses:
-                    if self.verbose:
-                        print(f"Already connected to peer at {ip}:{port}")
+                if peer_address in self.connected_peer_addresses or peer_address == ('127.0.0.1', self.listen_port):
                     continue
 
             if self.verbose:
@@ -246,32 +244,52 @@ class NodeClient:
         try:
             priority, piece_index = self.request_queue.get(timeout=10)
             with self.request_lock:
-                if piece_index in self.piece_manager.requested_pieces or piece_index in self.piece_manager.pieces:
-                    if self.verbose:
-                        print(f"Piece {piece_index} already requested or downloaded. Skipping.")
-                    return None  # Already requested or downloaded
-                self.piece_manager.requested_pieces.add(piece_index)
+                current_time = time.time()
+                if (piece_index in self.requested_pieces and
+                        current_time - self.request_timestamps.get(piece_index, 0) < self.request_timeout):
+                    # Re-add the piece to the queue for retry
+                    self.request_queue.put((priority, piece_index))
+                    return None
+                self.requested_pieces.add(piece_index)
+                self.request_timestamps[piece_index] = current_time
                 if self.verbose:
                     print(f"Requesting piece {piece_index} with priority {priority}.")
                 return piece_index
         except Empty:
             if self.verbose:
                 print("Request queue is empty. No pieces to request.")
-            return None  # No pieces available to request
+            return None
+
+    def handle_piece_download_timeout(self):
+        while self.running:
+            time.sleep(10)  # Check every 10 seconds
+            current_time = time.time()
+            with self.request_lock:
+                for piece_index in list(self.requested_pieces):
+                    if current_time - self.request_timestamps.get(piece_index, 0) > self.request_timeout:
+                        if self.verbose:
+                            print(f"Timeout for piece {piece_index}. Re-adding to request queue.")
+                        self.requested_pieces.discard(piece_index)
+                        self.request_timestamps.pop(piece_index, None)
+                        priority = self.piece_manager.piece_availability[piece_index]
+                        self.request_queue.put((priority, piece_index))
 
     def notify_piece_downloaded(self, piece_index):
         with self.request_lock:
-            # Update piece availability since a new peer now has this piece
-            self.piece_manager.piece_availability[piece_index] += 1
-            if self.verbose:
-                print(f"Piece {piece_index} is now available with availability {self.piece_manager.piece_availability[piece_index]}.")
-            # Re-populate the queue as piece availability might have changed
-            # This might be redundant if 'populate_request_queue' is running continuously
+            self.requested_pieces.discard(piece_index)
+            self.request_timestamps.pop(piece_index, None)
+        if self.verbose:
+            print(f"Piece {piece_index} downloaded and verified.")
+
+    def send_have_to_all(self, piece_index):
+        with self.lock:
+            for peer_conn in self.connected_peers:
+                peer_conn.send_have(piece_index)
 
     def display_statistics(self):
         previous_downloaded = 0
         previous_uploaded = 0
-        while not self.piece_manager.is_complete() and self.running:
+        while self.running:
             time.sleep(1)
             downloaded = self.piece_manager.downloaded
             uploaded = self.piece_manager.uploaded
@@ -281,4 +299,3 @@ class NodeClient:
             previous_uploaded = uploaded
             progress = (len(self.piece_manager.pieces) / self.piece_manager.total_pieces) * 100
             print(f"\rProgress: {progress:.2f}% | Downloaded: {downloaded} bytes ({download_speed} B/s) | Uploaded: {uploaded} bytes ({upload_speed} B/s)", end='')
-        print("\nDownload statistics display terminated.")
