@@ -1,5 +1,3 @@
-# node_client.py
-
 import threading
 import socket
 import time
@@ -20,8 +18,8 @@ class NodeClient:
         self.torrent_file = torrent_file
         self.listen_port = listen_port
         self.download_directory = download_directory
-        self.max_download_speed = max_download_speed  # Bytes per second
-        self.max_upload_speed = max_upload_speed      # Bytes per second
+        self.max_download_speed = max_download_speed  # Bytes per second (not actively enforced in this code)
+        self.max_upload_speed = max_upload_speed      # Bytes per second (not actively enforced in this code)
         self.verbose = verbose
         self.role = role  # 'seeder' or 'leecher'
         self.request_timestamps = {}
@@ -47,6 +45,10 @@ class NodeClient:
 
         self.has_announced_started = False  # To track if 'started' event has been sent
 
+        # For improved speed calculation and display
+        self.download_history = []
+        self.upload_history = []
+
     def generate_peer_id(self):
         # Ensure peer_id is exactly 20 bytes
         peer_id = '-PC0001-' + ''.join(random.choices(string.digits, k=12))
@@ -62,7 +64,7 @@ class NodeClient:
         # Start listening for peers (both seeders and leechers)
         threading.Thread(target=self.listen_for_peers, daemon=True).start()
 
-        # Start main loop
+        # Start main loop threads
         threading.Thread(target=self.handle_piece_download_timeout, daemon=True).start()
         self.main_loop()
 
@@ -114,6 +116,8 @@ class NodeClient:
         while self.running:
             try:
                 client_socket, addr = self.server_socket.accept()
+                if not self.running:
+                    break
                 if self.verbose:
                     print(f"Accepted connection from {addr}")
                 peer_conn = PeerConnection.from_incoming(client_socket, self.piece_manager, self.peer_id, self.info_hash, self, verbose=self.verbose)
@@ -125,6 +129,8 @@ class NodeClient:
                     print(f"Error accepting connections: {e}")
 
     def announce_to_tracker(self, event=None):
+        if not self.tracker_url:
+            return
         params = {
             'info_hash': self.info_hash,
             'peer_id': self.peer_id.encode('utf-8'),
@@ -218,6 +224,8 @@ class NodeClient:
     def connect_to_peers(self):
         self.announce_to_tracker()
         for peer_info in self.peers:
+            if not self.running:
+                break
             ip = peer_info.get('ip')
             port = int(peer_info.get('port'))
 
@@ -287,15 +295,61 @@ class NodeClient:
                 peer_conn.send_have(piece_index)
 
     def display_statistics(self):
-        previous_downloaded = 0
-        previous_uploaded = 0
+        start_time = time.time()
+        previous_time = start_time
+        previous_downloaded = self.piece_manager.downloaded
+        previous_uploaded = self.piece_manager.uploaded
+
         while self.running:
             time.sleep(1)
+            current_time = time.time()
+            interval = current_time - previous_time
+            elapsed = current_time - start_time
+            previous_time = current_time
+
             downloaded = self.piece_manager.downloaded
             uploaded = self.piece_manager.uploaded
-            download_speed = downloaded - previous_downloaded  # Bytes per second
-            upload_speed = uploaded - previous_uploaded
+            # Instantaneous speeds
+            instantaneous_download_speed = (downloaded - previous_downloaded) / interval if interval > 0 else 0
+            instantaneous_upload_speed = (uploaded - previous_uploaded) / interval if interval > 0 else 0
+
+            # Cumulative average speeds
+            avg_download_speed = downloaded / elapsed if elapsed > 0 else 0
+            avg_upload_speed = uploaded / elapsed if elapsed > 0 else 0
+
             previous_downloaded = downloaded
             previous_uploaded = uploaded
-            progress = (len(self.piece_manager.pieces) / self.piece_manager.total_pieces) * 100
-            print(f"\rProgress: {progress:.2f}% | Downloaded: {downloaded} bytes ({download_speed} B/s) | Uploaded: {uploaded} bytes ({upload_speed} B/s)", end='')
+
+            progress = (
+                                   len(self.piece_manager.pieces) / self.piece_manager.total_pieces) * 100 if self.piece_manager.total_pieces > 0 else 0
+
+
+    def stop(self):
+        # Graceful shutdown
+        self.running = False
+        # Announce 'stopped' event to the tracker
+        self.announce_to_tracker(event='stopped')
+
+        # Close peer connections and clear peers
+        with self.lock:
+            # Close all peer connections gracefully
+            for peer_conn in self.connected_peers:
+                peer_conn.running = False
+                try:
+                    peer_conn.socket.close()
+                except Exception:
+                    pass
+            self.connected_peers.clear()
+            self.connected_peer_addresses.clear()
+
+        # Clear out the peer list since we are no longer participating
+        self.peers.clear()
+
+        # Close the server socket if it's open
+        try:
+            self.server_socket.close()
+        except Exception:
+            pass
+
+        print("\nClient stopped and tracker notified. Peer list and connections cleared.")
+
