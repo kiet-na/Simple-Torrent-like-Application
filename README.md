@@ -51,3 +51,10 @@ Ensure you have the following installed on your system:
    ```bash
    git clone https://github.com/kiet-na/Simple-Torrent-like-Application.git
    cd Simple-Torrent-like-Application
+2. **Install Python Packages**
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+3. **Prepare Torrent Files**
+
