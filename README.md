@@ -8,14 +8,11 @@ A Python-based BitTorrent-like peer-to-peer (P2P) file-sharing system supporting
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
-- [Configuration](#configuration)
 - [Usage](#usage)
   - [Running the Tracker](#running-the-tracker)
   - [Running the Seeder](#running-the-seeder)
   - [Running the Leechers](#running-the-leechers)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
-- [Contact](#contact)
+
 
 ## Overview
 
@@ -57,4 +54,14 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 3. **Prepare Torrent Files**
+## Usage
+1. **Running the tracker**
 
+   ```bash
+   python simple_tracker.py
+3. **Running the seeder**
+   ```bash
+   python run_node.py path/to/seeder.torrent -p 6881 -o /path/to/download_directory --role seeder --verbose
+5. **Running the leecher**
+   ```bash
+   python run_node.py path/to/leecher.torrent -p 6882 -o /path/to/download_directory --role leecher --verbose
